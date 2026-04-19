@@ -247,7 +247,7 @@ class ClaudeSession:
     # Safety timer: if no output for this many seconds, session is considered stuck
     SAFETY_TIMEOUT_SECONDS = 15
     
-    def __init__(self, workdir="/Users/zoe/workspace", model="MiniMax-M2.7-highspeed",
+    def __init__(self, workdir="/tmp/hermes-claude-workdir", model="MiniMax-M2.7-highspeed",
                  api_key=None, api_base=None):
         self.workdir = workdir
         self.model = model
@@ -848,7 +848,7 @@ async def list_tools() -> list[Tool]:
                     },
                     "workdir": {
                         "type": "string",
-                        "description": "Working directory (defaults to /Users/zoe/workspace)"
+                        "description": "Working directory for Claude Code (defaults to /tmp/hermes-claude-workdir, isolated from production)"
                     },
                     "model": {
                         "type": "string",
