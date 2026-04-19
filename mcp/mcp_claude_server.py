@@ -688,6 +688,11 @@ class ClaudeSession:
                     msg = json.dumps({"method": "stop", "params": {}}) + "\n"
                     process.stdin.write(msg.encode())
                     await asyncio.wait_for(process.stdin.drain(), timeout=1.0)
+                except asyncio.TimeoutError:
+                    # Drain timeout means pipe buffer is full - stop message may not have been sent
+                    # This is non-fatal since we'll terminate the process anyway
+                    import sys
+                    print("[stop] drain() timeout - stop message may be lost, will force terminate", file=sys.stderr)
                 except Exception:
                     pass
                 finally:
@@ -707,9 +712,16 @@ class ClaudeSession:
                 try:
                     process.terminate()
                     await asyncio.wait_for(process.wait(), timeout=1.0)
+                except asyncio.TimeoutError:
+                    # Graceful termination failed - force kill
+                    try:
+                        process.kill()
+                        await asyncio.wait_for(process.wait(), timeout=1.0)
+                    except Exception:
+                        pass
                 except Exception:
                     pass
-                    
+
             finally:
                 process = None
         
@@ -758,14 +770,16 @@ atexit.register(ClaudeSession.cleanup_all_scripts)
 
 # Global session instance
 _session: Optional[ClaudeSession] = None
-_session_lock: asyncio.Lock = asyncio.Lock()  # Protect concurrent session operations
+_session_lock: asyncio.Lock = asyncio.Lock()  # Protect async session operations
+_session_threading_lock: threading.Lock = threading.Lock()  # Protect sync get_session()
 
 
 def get_session() -> ClaudeSession:
     global _session
-    if _session is None:
-        _session = ClaudeSession()
-    return _session
+    with _session_threading_lock:
+        if _session is None:
+            _session = ClaudeSession()
+        return _session
 
 
 async def reset_session_async():
