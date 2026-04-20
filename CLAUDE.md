@@ -11,6 +11,16 @@
 - **实时交互**：能看到中间过程（工具调用、thinking）
 - **参数透传**：plugins / hooks / agents / settings 必须能透传到 SDK
 
+## SDK 版本记录
+
+| 日期 | 版本 | 变化 |
+|------|------|------|
+| 2026-04-20 | 0.2.114 (最新) | 升级自0.2.92，API兼容 |
+| 之前 | 0.2.92 | 初始版本 |
+
+**SDK安装位置**：`/Users/zoe/workspace/node_modules/@anthropic-ai/claude-agent-sdk`
+**备份位置**：`/Users/zoe/workspace/node_modules_backup_20260420/`
+
 ## 项目结构
 
 ```
