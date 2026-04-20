@@ -39,7 +39,7 @@ from pathlib import Path
 # Import MCP server SDK
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
-from mcp.types import Tool, TextContent
+from mcp.types import Tool, TextContent, CallToolResult
 
 
 # Claude Session Implementation
@@ -245,9 +245,11 @@ class ClaudeSession:
     _server_paths = set()
     
     # Safety timer: if no output for this many seconds, session is considered stuck
-    SAFETY_TIMEOUT_SECONDS = 15
+    # Extended to 120s to allow Hermes time to poll for results (Hermes uses
+    # synchronous wait, not async poll - it relies on safety timer to return)
+    SAFETY_TIMEOUT_SECONDS = 120
     
-    def __init__(self, workdir="/tmp/hermes-claude-workdir", model="MiniMax-M2.7-highspeed",
+    def __init__(self, workdir="/Users/zoe/workspace", model="MiniMax-M2.7-highspeed",
                  api_key=None, api_base=None):
         self.workdir = workdir
         self.model = model
@@ -342,7 +344,7 @@ class ClaudeSession:
         self._last_output_time = time.time()
         if self._safety_timer:
             self._safety_timer.cancel()
-        if self._safety_callback and self.running:
+        if self.running:
             self._safety_timer = threading.Timer(
                 self.SAFETY_TIMEOUT_SECONDS,
                 self._safety_timer_fired
@@ -351,13 +353,39 @@ class ClaudeSession:
             self._safety_timer.start()
     
     def _safety_timer_fired(self):
-        """Called when safety timer expires (no output for SAFETY_TIMEOUT_SECONDS)."""
-        if self.running and self._safety_callback:
-            print(f"[SafetyTimer] No output for {self.SAFETY_TIMEOUT_SECONDS}s — triggering timeout callback", file=sys.stderr)
-            try:
-                self._safety_callback(self)
-            except Exception as e:
-                print(f"[SafetyTimer] Callback error: {e}", file=sys.stderr)
+        """Called when safety timer expires (no output for SAFETY_TIMEOUT_SECONDS).
+
+        SAFETY FIX: When safety timer fires, we MUST stop the session to prevent
+        Hermes from hanging forever. The callback is no longer optional - we directly
+        stop the session and signal that it ended abnormally.
+        """
+        if not self.running:
+            return
+        print(f"[SafetyTimer] No output for {self.SAFETY_TIMEOUT_SECONDS}s — stopping session", file=sys.stderr)
+        # Use stored event loop reference to schedule session stop
+        try:
+            if hasattr(self, '_event_loop') and self._event_loop is not None:
+                loop = self._event_loop
+                if loop.is_running():
+                    # Schedule async stop on the running event loop
+                    loop.call_soon_threadsafe(
+                        lambda: asyncio.create_task(self.stop())
+                    )
+                else:
+                    # Loop exists but not running - run synchronously
+                    loop.run_until_complete(self.stop())
+            else:
+                # No stored event loop - fall back to getting one
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    loop.call_soon_threadsafe(
+                        lambda: asyncio.create_task(self.stop())
+                    )
+                else:
+                    loop.run_until_complete(self.stop())
+        except Exception as e:
+            print(f"[SafetyTimer] Failed to stop session: {e}", file=sys.stderr)
+            self.running = False
     
     def _cancel_safety_timer(self):
         """Cancel the safety timer."""
@@ -596,11 +624,17 @@ class ClaudeSession:
         self.output = []
         self.session_id = None
         self._startup_event = asyncio.Event()
-        
+
+        # Store event loop reference for safety timer to use
+        try:
+            self._event_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            self._event_loop = asyncio.get_event_loop()
+
         # Start reader tasks using the CURRENT event loop (not a new one)
         self._reader_task = asyncio.create_task(self._read_stdout())
         self._stderr_task = asyncio.create_task(self._read_stderr())
-        
+
         # Start safety timer
         self._reset_safety_timer()
         
@@ -688,11 +722,6 @@ class ClaudeSession:
                     msg = json.dumps({"method": "stop", "params": {}}) + "\n"
                     process.stdin.write(msg.encode())
                     await asyncio.wait_for(process.stdin.drain(), timeout=1.0)
-                except asyncio.TimeoutError:
-                    # Drain timeout means pipe buffer is full - stop message may not have been sent
-                    # This is non-fatal since we'll terminate the process anyway
-                    import sys
-                    print("[stop] drain() timeout - stop message may be lost, will force terminate", file=sys.stderr)
                 except Exception:
                     pass
                 finally:
@@ -712,16 +741,9 @@ class ClaudeSession:
                 try:
                     process.terminate()
                     await asyncio.wait_for(process.wait(), timeout=1.0)
-                except asyncio.TimeoutError:
-                    # Graceful termination failed - force kill
-                    try:
-                        process.kill()
-                        await asyncio.wait_for(process.wait(), timeout=1.0)
-                    except Exception:
-                        pass
                 except Exception:
                     pass
-
+                    
             finally:
                 process = None
         
@@ -770,16 +792,14 @@ atexit.register(ClaudeSession.cleanup_all_scripts)
 
 # Global session instance
 _session: Optional[ClaudeSession] = None
-_session_lock: asyncio.Lock = asyncio.Lock()  # Protect async session operations
-_session_threading_lock: threading.Lock = threading.Lock()  # Protect sync get_session()
+_session_lock: asyncio.Lock = asyncio.Lock()  # Protect concurrent session operations
 
 
 def get_session() -> ClaudeSession:
     global _session
-    with _session_threading_lock:
-        if _session is None:
-            _session = ClaudeSession()
-        return _session
+    if _session is None:
+        _session = ClaudeSession()
+    return _session
 
 
 async def reset_session_async():
@@ -848,7 +868,7 @@ async def list_tools() -> list[Tool]:
                     },
                     "workdir": {
                         "type": "string",
-                        "description": "Working directory for Claude Code (defaults to /tmp/hermes-claude-workdir, isolated from production)"
+                        "description": "Working directory (defaults to /Users/zoe/workspace)"
                     },
                     "model": {
                         "type": "string",
@@ -1051,7 +1071,7 @@ def _parse_output_line(line: bytes | str) -> dict:
 
 
 @server.call_tool()
-async def call_tool(name: str, arguments: Any) -> list[TextContent]:
+async def call_tool(name: str, arguments: Any):
     """Handle tool calls."""
     session = get_session()
     
@@ -1270,7 +1290,8 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
 
         # No output - check if session is still active or really dead
         if not session.is_running():
-            return [TextContent(type="text", text="No active session.")]
+            # Raise an exception so FastMCP returns isError=True to Hermes
+            raise RuntimeError("Session ended. Claude Code session has terminated.")
 
         return [TextContent(type="text", text="(no new output)")]
     
@@ -1312,6 +1333,7 @@ def run_http_mode(host: str = "127.0.0.1", port: int = 8765):
         host=host,
         port=port,
         streamable_http_path="/mcp",
+        # stateless_http=True removed - session ID passing needed for hermes-agent
     )
 
     # Get the session instance - use closure to store session
